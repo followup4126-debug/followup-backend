@@ -172,6 +172,11 @@ func setupRouter(cfg *config.Config, storyService *services.StoryService, diffEn
 	router.Use(api.RateLimitMiddleware(cfg.RateLimit))
 	router.Use(api.CORSMiddleware())
 
+	// Root route — avoids 404 on health probes hitting "/"
+	router.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "followup-backend"})
+	})
+
 	// Health check
 	router.GET("/health", api.HealthCheck)
 

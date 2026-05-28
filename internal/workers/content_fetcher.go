@@ -55,8 +55,13 @@ func (cf *ContentFetcher) FetchContent(source models.Source) (string, error) {
 }
 
 func (cf *ContentFetcher) fetchRSSContent(source models.Source) (string, error) {
+	// Guard: skip entries that are not valid HTTP(S) URLs (e.g. bare search IDs stored in legacy stories)
+	if !strings.HasPrefix(source.URL, "http://") && !strings.HasPrefix(source.URL, "https://") {
+		return "", fmt.Errorf("skipping non-URL source: %q", source.URL)
+	}
+
 	logrus.WithField("url", source.URL).Debug("Fetching RSS content")
-	
+
 	feed, err := cf.rssParser.ParseURL(source.URL)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse RSS feed: %w", err)
