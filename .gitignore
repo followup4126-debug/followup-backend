@@ -48,6 +48,9 @@ fix_s3_public_access.go
 /*.md
 !/README.md
 
+# Frontend lives in its own repo
+frontend/
+
 # Temp/scratch files
 response.txt
 *.out
