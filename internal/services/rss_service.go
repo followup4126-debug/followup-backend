@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -434,9 +435,28 @@ func (r *RSSService) FetchHeadlinesBySource(source string) ([]Headline, error) {
 }
 
 func (r *RSSService) fetchHeadlinesFromFeed(feedURL, category string) ([]Headline, error) {
-	feed, err := r.parser.ParseURL(feedURL)
+	// Fetch with a browser User-Agent so news sites don't block the request
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("GET", feedURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse feed: %w", err)
+		return nil, fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)")
+	req.Header.Set("Accept", "application/rss+xml, application/xml, text/xml, */*")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("feed returned HTTP %d", resp.StatusCode)
+	}
+
+	feed, err := r.parser.Parse(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse feed body: %w", err)
 	}
 
 	headlines := make([]Headline, 0, len(feed.Items))
