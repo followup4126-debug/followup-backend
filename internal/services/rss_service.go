@@ -57,6 +57,8 @@ func NewRSSService(db *database.MongoDB, redis *database.Redis, rssFeeds []strin
 		parser: gofeed.NewParser(),
 	}
 	svc.cleanupLegacyFeeds()
+	svc.migrateRSSHubURLs()
+	svc.seedDefaultFeeds(rssFeeds)
 	return svc
 }
 
@@ -74,6 +76,90 @@ func (r *RSSService) cleanupLegacyFeeds() {
 	// Remove broken public RSSHub Twitter feeds
 	_, _ = r.col().DeleteMany(ctx, bson.M{"url": bson.M{"$regex": "rsshub\\.app/twitter"}})
 	_, _ = r.col().DeleteMany(ctx, bson.M{"url": bson.M{"$regex": "nitter\\."}})
+}
+
+// migrateRSSHubURLs rewrites any stored rsshub.app URLs to the configured RSSHUB_URL instance.
+// This fixes feeds that were added before RSSHUB_URL was set.
+func (r *RSSService) migrateRSSHubURLs() {
+	rsshubBase := os.Getenv("RSSHUB_URL")
+	if rsshubBase == "" {
+		return // nothing to migrate to
+	}
+	rsshubBase = strings.TrimRight(rsshubBase, "/")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cursor, err := r.col().Find(ctx, bson.M{"url": bson.M{"$regex": "rsshub\\.app"}})
+	if err != nil {
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var feeds []models.RSSFeed
+	if err = cursor.All(ctx, &feeds); err != nil || len(feeds) == 0 {
+		return
+	}
+
+	for _, f := range feeds {
+		// Replace the rsshub.app host with the configured instance
+		newURL := strings.Replace(f.URL, "https://rsshub.app", rsshubBase, 1)
+		newURL = strings.Replace(newURL, "http://rsshub.app", rsshubBase, 1)
+		if newURL == f.URL {
+			continue
+		}
+		_, _ = r.col().UpdateOne(ctx,
+			bson.M{"_id": f.ID},
+			bson.M{"$set": bson.M{"url": newURL, "updated_at": time.Now()}},
+		)
+		logrus.WithFields(logrus.Fields{"old": f.URL, "new": newURL}).Info("Migrated RSSHub URL to configured instance")
+	}
+	r.invalidateCaches()
+}
+
+// seedDefaultFeeds inserts feeds from the RSS_FEEDS env var if the collection is empty.
+// This ensures the app works out-of-the-box on a fresh deployment.
+func (r *RSSService) seedDefaultFeeds(feedURLs []string) {
+	if len(feedURLs) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	count, err := r.col().CountDocuments(ctx, bson.M{})
+	if err != nil || count > 0 {
+		return // already has feeds, don't overwrite
+	}
+
+	logrus.WithField("count", len(feedURLs)).Info("Seeding default RSS feeds from RSS_FEEDS env")
+	for _, u := range feedURLs {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		// Derive a readable name from the URL
+		name := u
+		if parts := strings.Split(strings.TrimRight(u, "/"), "/"); len(parts) > 0 {
+			host := parts[2] // e.g. "feeds.bbci.co.uk"
+			host = strings.TrimPrefix(host, "www.")
+			host = strings.TrimPrefix(host, "feeds.")
+			name = host
+		}
+		feed := models.RSSFeed{
+			ID:        primitive.NewObjectID(),
+			Name:      name,
+			URL:       u,
+			Category:  "General",
+			Active:    true,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		if _, err := r.col().InsertOne(ctx, feed); err != nil {
+			logrus.WithError(err).WithField("url", u).Warn("Failed to seed RSS feed")
+		}
+	}
+	r.invalidateCaches()
 }
 
 // GetRSSFeeds returns all feeds, using Redis cache
@@ -271,27 +357,36 @@ func (r *RSSService) FetchAllHeadlines() ([]Headline, error) {
 		return []Headline{}, nil
 	}
 
-	urls := make([]string, 0, len(feeds))
+	var headlines []Headline
+	rsshubBase := os.Getenv("RSSHUB_URL")
+	if rsshubBase == "" {
+		rsshubBase = "https://rsshub.app"
+	}
+	rsshubBase = strings.TrimRight(rsshubBase, "/")
+
 	for _, f := range feeds {
-		if f.Active {
-			urls = append(urls, f.URL)
+		if !f.Active {
+			continue
 		}
+		feedURL := f.URL
+		// Convert legacy twitter:// scheme to RSSHub URL
+		if strings.HasPrefix(feedURL, "twitter://") {
+			handle := strings.TrimPrefix(feedURL, "twitter://")
+			feedURL = rsshubBase + "/twitter/user/" + handle
+		}
+		items, err := r.fetchHeadlinesFromFeed(feedURL, f.Category)
+		if err != nil {
+			logrus.WithError(err).WithField("feed", feedURL).Warn("Failed to fetch headlines from feed, skipping")
+			continue
+		}
+		// Override source with the DB feed name so the frontend filter matches exactly
+		for i := range items {
+			items[i].Source = f.Name
+		}
+		headlines = append(headlines, items...)
 	}
 
-	headlines, err := r.fetchFromURLs(urls, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// Attach category from DB feed
-	for i, h := range headlines {
-		for _, f := range feeds {
-			if strings.Contains(h.Source, f.Name) || strings.Contains(f.URL, strings.ToLower(h.Source)) {
-				headlines[i].Category = f.Category
-				break
-			}
-		}
-	}
+	logrus.WithField("count", len(headlines)).Info("Fetched RSS headlines")
 
 	// Cache headlines
 	if data, err := json.Marshal(headlines); err == nil {
