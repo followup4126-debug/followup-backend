@@ -23,6 +23,8 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
 const (
 	cacheKeyFeeds     = "rss:feeds"
 	cacheTTLFeeds     = 5 * time.Minute
@@ -314,7 +316,7 @@ func discoverFeedURL(siteURL string) string {
 		if err != nil {
 			continue
 		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)")
+		req.Header.Set("User-Agent", browserUserAgent)
 		req.Header.Set("Accept", "application/rss+xml, application/xml, text/xml, */*")
 
 		resp, err := client.Do(req)
@@ -336,7 +338,7 @@ func discoverFeedURL(siteURL string) string {
 	if err != nil {
 		return ""
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)")
+	req.Header.Set("User-Agent", browserUserAgent)
 	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		return ""
@@ -553,7 +555,7 @@ func (r *RSSService) fetchHeadlinesFromFeed(feedURL, category string) ([]Headlin
 	if err != nil {
 		return nil, fmt.Errorf("failed to build request: %w", err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)")
+	req.Header.Set("User-Agent", browserUserAgent)
 	req.Header.Set("Accept", "application/rss+xml, application/xml, text/xml, */*")
 
 	resp, err := client.Do(req)
