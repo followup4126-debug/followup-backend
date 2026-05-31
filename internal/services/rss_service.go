@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -237,6 +238,7 @@ func (r *RSSService) AddRSSFeed(feedURL, feedName, category string) (*models.RSS
 
 // normalizeToRSSURL validates and normalises a feed URL.
 // Twitter/X handles are routed through the self-hosted RSSHub instance (RSSHUB_URL env var).
+// For plain website URLs that aren't already a feed, it auto-discovers the RSS feed URL.
 func normalizeToRSSURL(input string) (string, error) {
 	input = strings.TrimSpace(input)
 
@@ -263,13 +265,123 @@ func normalizeToRSSURL(input string) (string, error) {
 		}
 	}
 
-	// Already a proper URL
-	if strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://") {
+	// Bare domain without scheme — add https://
+	if !strings.HasPrefix(input, "http://") && !strings.HasPrefix(input, "https://") {
+		input = "https://" + input
+	}
+
+	// If the URL already looks like a feed path, use it as-is
+	lower := strings.ToLower(input)
+	if strings.Contains(lower, "/feed") ||
+		strings.Contains(lower, "/rss") ||
+		strings.Contains(lower, ".xml") ||
+		strings.Contains(lower, ".rss") {
 		return input, nil
 	}
 
-	// Bare domain without scheme
-	return "https://" + input, nil
+	// It looks like a homepage — try to discover the actual feed URL
+	discovered := discoverFeedURL(input)
+	if discovered != "" {
+		logrus.WithFields(logrus.Fields{"input": input, "discovered": discovered}).Info("Auto-discovered RSS feed URL")
+		return discovered, nil
+	}
+
+	// Fall back to the URL as entered
+	return input, nil
+}
+
+// discoverFeedURL tries common feed paths and parses HTML <link> tags to find an RSS feed.
+func discoverFeedURL(siteURL string) string {
+	base := strings.TrimRight(siteURL, "/")
+
+	// Common feed paths to try in order
+	candidates := []string{
+		base + "/feed/",
+		base + "/feed",
+		base + "/rss/",
+		base + "/rss",
+		base + "/rss.xml",
+		base + "/atom.xml",
+		base + "/feed.xml",
+		base + "/index.xml",
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	// Try each candidate — if it returns a valid RSS/Atom content-type, use it
+	for _, candidate := range candidates {
+		req, err := http.NewRequest("GET", candidate, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)")
+		req.Header.Set("Accept", "application/rss+xml, application/xml, text/xml, */*")
+
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			continue
+		}
+		ct := strings.ToLower(resp.Header.Get("Content-Type"))
+		resp.Body.Close()
+		if strings.Contains(ct, "xml") || strings.Contains(ct, "rss") || strings.Contains(ct, "atom") {
+			return candidate
+		}
+	}
+
+	// Last resort: fetch the homepage and look for <link rel="alternate" type="application/rss+xml">
+	req, err := http.NewRequest("GET", siteURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)")
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	// Read up to 64KB — enough to find the <head> section
+	buf := make([]byte, 65536)
+	n, _ := resp.Body.Read(buf)
+	body := string(buf[:n])
+
+	// Look for RSS/Atom link tags
+	re := regexp.MustCompile(`(?i)<link[^>]+type=["'](application/rss\+xml|application/atom\+xml)["'][^>]*href=["']([^"']+)["']`)
+	if m := re.FindStringSubmatch(body); len(m) >= 3 {
+		href := m[2]
+		if strings.HasPrefix(href, "http") {
+			return href
+		}
+		// Relative URL — make it absolute
+		parsed, err := url.Parse(siteURL)
+		if err == nil {
+			feedParsed, err := url.Parse(href)
+			if err == nil {
+				return parsed.ResolveReference(feedParsed).String()
+			}
+		}
+	}
+
+	// Also try href before type attribute order
+	re2 := regexp.MustCompile(`(?i)<link[^>]+href=["']([^"']+)["'][^>]*type=["'](application/rss\+xml|application/atom\+xml)["']`)
+	if m := re2.FindStringSubmatch(body); len(m) >= 2 {
+		href := m[1]
+		if strings.HasPrefix(href, "http") {
+			return href
+		}
+		parsed, err := url.Parse(siteURL)
+		if err == nil {
+			feedParsed, err := url.Parse(href)
+			if err == nil {
+				return parsed.ResolveReference(feedParsed).String()
+			}
+		}
+	}
+
+	return ""
 }
 
 // UpdateRSSFeed updates a feed by ID and invalidates cache
