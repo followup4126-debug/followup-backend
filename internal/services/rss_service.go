@@ -62,6 +62,7 @@ func NewRSSService(db *database.MongoDB, redis *database.Redis, rssFeeds []strin
 	}
 	svc.cleanupLegacyFeeds()
 	svc.migrateRSSHubURLs()
+	svc.fixBareHomepageURLs()
 	svc.seedDefaultFeeds(rssFeeds)
 	return svc
 }
@@ -80,6 +81,56 @@ func (r *RSSService) cleanupLegacyFeeds() {
 	// Remove broken public RSSHub Twitter feeds
 	_, _ = r.col().DeleteMany(ctx, bson.M{"url": bson.M{"$regex": "rsshub\\.app/twitter"}})
 	_, _ = r.col().DeleteMany(ctx, bson.M{"url": bson.M{"$regex": "nitter\\."}})
+}
+
+// fixBareHomepageURLs runs on startup and auto-discovers the real RSS feed URL
+// for any stored feed that has a bare homepage URL (no /feed, /rss, .xml path).
+func (r *RSSService) fixBareHomepageURLs() {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cursor, err := r.col().Find(ctx, bson.M{})
+	if err != nil {
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var feeds []models.RSSFeed
+	if err = cursor.All(ctx, &feeds); err != nil {
+		return
+	}
+
+	fixed := 0
+	for _, f := range feeds {
+		lower := strings.ToLower(f.URL)
+		// Skip feeds that already have a proper feed path or are Twitter/RSSHub feeds
+		if strings.Contains(lower, "/feed") ||
+			strings.Contains(lower, "/rss") ||
+			strings.Contains(lower, ".xml") ||
+			strings.Contains(lower, ".rss") ||
+			strings.Contains(lower, "/twitter/") {
+			continue
+		}
+		// This looks like a bare homepage — try to discover the real feed URL
+		discovered := discoverFeedURL(f.URL)
+		if discovered == "" || discovered == f.URL {
+			logrus.WithField("url", f.URL).Warn("Could not auto-discover RSS feed URL for homepage")
+			continue
+		}
+		_, err := r.col().UpdateOne(ctx,
+			bson.M{"_id": f.ID},
+			bson.M{"$set": bson.M{"url": discovered, "updated_at": time.Now()}},
+		)
+		if err == nil {
+			logrus.WithFields(logrus.Fields{"old": f.URL, "new": discovered, "name": f.Name}).
+				Info("Fixed bare homepage URL to discovered feed URL")
+			fixed++
+		}
+	}
+	if fixed > 0 {
+		r.invalidateCaches()
+		logrus.WithField("count", fixed).Info("Fixed bare homepage feed URLs on startup")
+	}
 }
 
 // migrateRSSHubURLs rewrites any stored rsshub.app URLs to the configured RSSHUB_URL instance.
